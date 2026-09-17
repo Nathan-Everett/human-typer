@@ -5,6 +5,7 @@ A macOS app that types text for you — but makes it look human. Built with Pyth
 ## Features
 
 - Adjustable WPM and realistic typing variance
+- Unicode text support, including smart punctuation, accents, and emoji
 - Typo simulation (random, adjacent-key, capitalization errors)
 - Fatigue simulation — gradually slows down like a real person
 - Word-level acceleration — faster mid-word, slower at edges
@@ -18,7 +19,6 @@ A macOS app that types text for you — but makes it look human. Built with Pyth
 - Presets — save and load your favorite settings
 - Text history — quickly reload recently typed text
 - Load from file — import any `.txt` file
-- **Claude Code integration** — send text directly from Claude via local HTTP server
 
 ## Requirements
 
@@ -37,6 +37,10 @@ pip install -r requirements.txt
 python3 human_typer.py
 ```
 
+On first launch, allow the Python app under **System Settings → Privacy &
+Security → Accessibility**, then restart Human Typer. macOS blocks simulated
+keystrokes until this permission is granted.
+
 ### Global Hotkeys
 
 | Hotkey | Action |
@@ -45,18 +49,11 @@ python3 human_typer.py
 | Ctrl + Option + S | Stop typing |
 | Ctrl + Option + Space | Resume chunk (when paused) |
 
-### Claude Code Integration
-
-With Human Typer running, send text to it from Claude Code (or any terminal):
-
-```bash
-# Fill the text box
-curl -X POST http://localhost:7799/type -d "your text here"
-
-# Fill the text box and start typing immediately
-curl -X POST http://localhost:7799/type-and-start -d "your text here"
-```
-
 ## Bugs & Feedback
 
 This app is still in active development and may have bugs. If you run into any issues or have suggestions, feel free to open an issue on GitHub — any feedback is appreciated!
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the source layout, threading model,
+persistence format, scroll behavior, and verification checklist.

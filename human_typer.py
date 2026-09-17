@@ -1,102 +1,84 @@
-import pyautogui
-import time
-import random
-import re
-import subprocess
-import threading
+"""Human Typer: a macOS utility for natural-looking automated typing.
+
+The module is organized in execution order:
+
+1. Native keyboard and timing helpers.
+2. JSON-backed history, presets, and settings.
+3. Custom widgets and visual tokens.
+4. Sequential construction of the main and settings pages.
+5. Background-thread, hotkey, and AppKit event coordination.
+
+Tkinter widgets must only be updated on the main thread. Worker threads and
+AppKit delegates therefore communicate with the UI through ``_ui_queue``.
+"""
+
+import json
 import math
 import os
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import queue as _queue_mod
+import queue
+import random
+import re
+import sys
+import threading
+import time
+
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 from pynput import keyboard as pynput_keyboard
 
-from Quartz import (
-    CGEventCreateKeyboardEvent,
-    CGEventPostToPid,
-    CGEventKeyboardSetUnicodeString,
-)
 from AppKit import (
-    NSStatusBar, NSApplication, NSObject,
-    NSMenu, NSMenuItem, NSImage, NSAlert,
-    NSApplicationActivationPolicyRegular,
+    NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyRegular,
+    NSImage,
+    NSMenu,
+    NSMenuItem,
+    NSObject,
+    NSStatusBar,
+    NSWorkspace,
 )
 from ApplicationServices import AXIsProcessTrustedWithOptions
-
-# ── pyautogui ─────────────────────────────────────────────────────────────────
-pyautogui.PAUSE = 0
-pyautogui.FAILSAFE = False  # prevent corner-of-screen crash during typing
+from Quartz import (
+    CGEventCreateKeyboardEvent,
+    CGEventKeyboardSetUnicodeString,
+    CGEventPost,
+    CGEventPostToPid,
+    kCGHIDEventTap,
+)
 
 # ── App appearance ────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-LOGO_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_typer_icon.png")
+LOGO_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_typer_icon_hd.png")
 PRESETS_PATH  = os.path.expanduser("~/.humantyper_presets.json")
 HISTORY_PATH  = os.path.expanduser("~/.humantyper_history.json")
 SETTINGS_PATH = os.path.expanduser("~/.humantyper_settings.json")
 MAX_HISTORY   = 10
 
-# ── Thread-safe queue for AppKit → tkinter calls ─────────────────────────────
-_ui_queue = _queue_mod.Queue()
+WINDOW_MODE_VALUES = {
+    "Dock + Menu Bar": "both",
+    "Dock Only": "dock",
+    "Menu Bar Only": "menubar",
+    "Neither": "neither",
+}
+
+UI_COMMAND_STATUS = "status"
+UI_COMMAND_PROGRESS = "progress"
+UI_COMMAND_START = "start"
+UI_COMMAND_SHOW = "show"
+UI_COMMAND_QUIT = "quit"
+UI_COMMAND_TOGGLE_PIN = "toggle_pin"
+
+# Thread-safe queue for background work to reach tkinter's main thread.
+_ui_queue = queue.Queue()
 
 # ── Global state ──────────────────────────────────────────────────────────────
-stop_flag         = False
-chunk_waiting     = False
+stop_flag = False
 chunk_resume_event = threading.Event()
-_KEY_CODES        = {'\n': 36, '\t': 48}
-_BACKSPACE        = 51
-
-# ── Local HTTP server (for Claude Code integration) ───────────────────────────
-HTTP_PORT    = 7799
-_http_server = None
-
-class _TypeHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # suppress console noise
-
-    def do_POST(self):
-        if self.path not in ("/type", "/type-and-start"):
-            self.send_response(404); self.end_headers(); return
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length).decode("utf-8", errors="replace").strip()
-        if not body:
-            self.send_response(400); self.end_headers()
-            self.wfile.write(b"No text provided"); return
-
-        auto_start = self.path == "/type-and-start"
-
-        def _inject():
-            text_box.delete("1.0", "end")
-            text_box.insert("1.0", body)
-            update_counts()
-            show_page("main")
-            if auto_start:
-                start_typing()
-
-        app.after(0, _inject)
-        self.send_response(200); self.end_headers()
-        msg = f"Loaded {len(body)} chars" + (" — typing started" if auto_start else "")
-        self.wfile.write(msg.encode())
-
-    def do_GET(self):
-        if self.path == "/status":
-            self.send_response(200); self.end_headers()
-            self.wfile.write(b"Human Typer running"); return
-        self.send_response(404); self.end_headers()
-
-def _start_http_server():
-    global _http_server
-    try:
-        _http_server = HTTPServer(("127.0.0.1", HTTP_PORT), _TypeHandler)
-        _http_server.serve_forever()
-    except OSError:
-        pass  # port already in use — fail silently
-
-threading.Thread(target=_start_http_server, daemon=True).start()
+typing_thread = None
+_KEY_CODES = {"\n": 36, "\t": 48}
+_BACKSPACE = 51
 
 PUNCT_DELAYS = {
     ',':  (0.00, 0.03), '.':  (0.00, 0.03), "'":  (0.02, 0.06),
@@ -146,31 +128,39 @@ def make_gear_icon(size=22, color=(160, 200, 220)):
     d.ellipse([cx - hole_r,  cy - hole_r,  cx + hole_r,  cy + hole_r],  fill=(0, 0, 0, 0))
     return img.resize((size, size), Image.LANCZOS)
 
-# ── Background typing helpers ─────────────────────────────────────────────────
+# Native macOS typing helpers
 def get_frontmost_pid():
-    script = 'tell application "System Events" to get unix id of first process whose frontmost is true'
-    result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+    """Return the process ID of the frontmost macOS application, if any."""
     try:
-        return int(result.stdout.strip())
+        frontmost_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(frontmost_app.processIdentifier()) if frontmost_app else None
     except Exception:
         return None
 
-def _post_key(pid, keycode, down):
-    CGEventPostToPid(pid, CGEventCreateKeyboardEvent(None, keycode, down))
-
-def bg_type_char(char, pid):
-    if char in _KEY_CODES:
-        _post_key(pid, _KEY_CODES[char], True)
-        _post_key(pid, _KEY_CODES[char], False)
+def _post_event(event, pid=None):
+    if pid is None:
+        CGEventPost(kCGHIDEventTap, event)
     else:
+        CGEventPostToPid(pid, event)
+
+def _post_key(keycode, down, pid=None):
+    _post_event(CGEventCreateKeyboardEvent(None, keycode, down), pid)
+
+def type_char(char, pid=None):
+    """Post one Unicode character globally or directly to ``pid``."""
+    if char in _KEY_CODES:
+        _post_key(_KEY_CODES[char], True, pid)
+        _post_key(_KEY_CODES[char], False, pid)
+    else:
+        utf16_length = len(char.encode("utf-16-le")) // 2
         for down in (True, False):
             e = CGEventCreateKeyboardEvent(None, 0, down)
-            CGEventKeyboardSetUnicodeString(e, len(char), char)
-            CGEventPostToPid(pid, e)
+            CGEventKeyboardSetUnicodeString(e, utf16_length, char)
+            _post_event(e, pid)
 
-def bg_backspace(pid):
-    _post_key(pid, _BACKSPACE, True)
-    _post_key(pid, _BACKSPACE, False)
+def press_backspace(pid=None):
+    _post_key(_BACKSPACE, True, pid)
+    _post_key(_BACKSPACE, False, pid)
 
 # ── Typing helpers ────────────────────────────────────────────────────────────
 def punctuation_delay(char):
@@ -180,6 +170,7 @@ def punctuation_delay(char):
     return 0.0
 
 def breaks_interval(intensity):
+    """Choose the word interval before the next simulated human pause."""
     max_i, min_i = 50, 2
     interval = max_i - (intensity - 1) / 99 * (max_i - min_i)
     lo = max(1, int(interval * 0.7))
@@ -187,10 +178,19 @@ def breaks_interval(intensity):
     return random.randint(lo, hi)
 
 def fmt_seconds(secs):
+    """Format an approximate duration for the text statistics row."""
     secs = int(secs)
     if secs < 60:
         return f"~{secs}s"
     return f"~{secs // 60}m {secs % 60}s"
+
+
+def format_cap_intensity(value):
+    """Convert the capitalization-error slider value to its display label."""
+    numeric_value = int(value)
+    if numeric_value == 0:
+        return "Off"
+    return f"~{max(1, round(numeric_value / 2))}%"
 
 # Adjacent keys on a standard QWERTY keyboard
 _ADJACENT = {
@@ -213,6 +213,7 @@ def adjacent_key(char):
     return random.choice("abcdefghijklmnopqrstuvwxyz")
 
 def do_typo(char, intensity, adjacent_only, background_mode, target_pid):
+    """Simulate one typo and return the selected correction style."""
     roll          = random.random()
     wrong_weight  = 1.0
     double_weight = max(0.0, (intensity - 0.3) / 0.7)
@@ -222,16 +223,10 @@ def do_typo(char, intensity, adjacent_only, background_mode, target_pid):
     double_thresh = wrong_thresh + double_weight / total
 
     def type_it(c):
-        if background_mode and target_pid:
-            bg_type_char(c, target_pid)
-        else:
-            pyautogui.write(c)
+        type_char(c, target_pid if background_mode else None)
 
     def backspace():
-        if background_mode and target_pid:
-            bg_backspace(target_pid)
-        else:
-            pyautogui.press("backspace")
+        press_backspace(target_pid if background_mode else None)
 
     if roll < wrong_thresh:
         wrong = adjacent_key(char) if adjacent_only else random.choice("abcdefghijklmnopqrstuvwxyz")
@@ -256,7 +251,12 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
               countdown, chunk_mode, chunk_size,
               loop_enabled, loop_count, loop_delay,
               status_cb, progress_cb):
-    global stop_flag, chunk_waiting
+    """Type text using the configured humanization model.
+
+    This function runs on a worker thread. It must report UI changes through
+    ``status_cb`` and ``progress_cb`` rather than touching Tk widgets directly.
+    """
+    global stop_flag
 
     for i in range(countdown, 0, -1):
         if stop_flag:
@@ -266,12 +266,12 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
         time.sleep(1)
 
     target_pid = get_frontmost_pid() if background_mode else None
+    if background_mode and target_pid is None:
+        status_cb("Could not identify the target window.")
+        return
 
     def type_it(c):
-        if background_mode and target_pid:
-            bg_type_char(c, target_pid)
-        else:
-            pyautogui.write(c)
+        type_char(c, target_pid if background_mode else None)
 
     total_loops = loop_count if loop_enabled else 1
     loop_num    = 0
@@ -314,17 +314,21 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
             is_real  = bool(stripped)
 
             # ── Human break ──────────────────────────────────────────────────
-            if breaks_enabled and is_real and words_typed > 0 and words_typed % max(1, int(next_break)) == 0:
+            break_due = (
+                breaks_enabled
+                and is_real
+                and words_typed > 0
+                and words_typed % max(1, int(next_break)) == 0
+            )
+            if break_due:
                 time.sleep(random.uniform(0.8, 2.5))
                 next_break = breaks_interval(breaks_intensity)
 
             # ── Chunk mode pause ─────────────────────────────────────────────
             if chunk_mode and is_real and chunk_count > 0 and chunk_count >= next_chunk_at:
-                chunk_waiting = True
                 chunk_resume_event.clear()
                 status_cb("Paused — press Ctrl+Opt+Space to continue...")
                 chunk_resume_event.wait()
-                chunk_waiting = False
                 if stop_flag:
                     break
                 chunk_count   = 0
@@ -362,29 +366,47 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
 
                 made_typo = False
                 style     = None
-                if typo_intensity > 0 and random.random() < (0.5 * typo_intensity) and char.isalpha():
-                    style     = do_typo(char, typo_intensity, adjacent_only, background_mode, target_pid)
+                should_make_typo = (
+                    typo_intensity > 0
+                    and random.random() < (0.5 * typo_intensity)
+                    and char.isalpha()
+                )
+                if should_make_typo:
+                    style = do_typo(
+                        char,
+                        typo_intensity,
+                        adjacent_only,
+                        background_mode,
+                        target_pid,
+                    )
                     made_typo = True
                     if style == "swap" and ci + 1 < len(chars) and chars[ci + 1].isalpha():
                         next_char = chars[ci + 1]
-                        type_it(next_char); time.sleep(random.uniform(0.05, 0.12))
-                        type_it(char);      time.sleep(random.uniform(0.08, 0.18))
-                        if background_mode and target_pid:
-                            bg_backspace(target_pid); bg_backspace(target_pid)
-                        else:
-                            pyautogui.press("backspace"); pyautogui.press("backspace")
+                        type_it(next_char)
+                        time.sleep(random.uniform(0.05, 0.12))
+                        type_it(char)
+                        time.sleep(random.uniform(0.08, 0.18))
+                        pid = target_pid if background_mode else None
+                        press_backspace(pid)
+                        press_backspace(pid)
                         time.sleep(0.08)
-                        type_it(char);      time.sleep(random.uniform(0.04, 0.10))
+                        type_it(char)
+                        time.sleep(random.uniform(0.04, 0.10))
                         type_it(next_char)
                         chars_done += 2
                         ci += 2
-                        alpha_idx += 2
+                        alpha_idx += 1
                         progress_cb(min(1.0, chars_done / total_chars))
-                        delay = base_delay * accel * fatigue_mult * (1 + random.uniform(-var_pct, var_pct))
+                        variance_multiplier = 1 + random.uniform(-var_pct, var_pct)
+                        delay = base_delay * accel * fatigue_mult * variance_multiplier
                         remaining = delay - (time.time() - t0)
                         if remaining > 0:
                             time.sleep(remaining)
                         continue
+                    if style == "swap":
+                        # A swap needs another letter. At a word boundary, type
+                        # the current character normally instead of dropping it.
+                        made_typo = False
 
                 if not made_typo or style != "swap":
                     # Capitalization error — type wrong case then backspace-correct
@@ -394,10 +416,7 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
                             wrong_case = char.upper() if char.islower() else char.lower()
                             type_it(wrong_case)
                             time.sleep(random.uniform(0.06, 0.16))
-                            if background_mode and target_pid:
-                                bg_backspace(target_pid)
-                            else:
-                                pyautogui.press("backspace")
+                            press_backspace(target_pid if background_mode else None)
                             time.sleep(random.uniform(0.04, 0.10))
                     type_it(char)
 
@@ -425,56 +444,55 @@ def type_text(text, wpm, typo_intensity, adjacent_only, cap_intensity, variance,
         status_cb("Stopped.")
 
 # ── History ───────────────────────────────────────────────────────────────────
+def _load_json(path, default):
+    """Load a JSON file, returning ``default`` when it is absent or invalid."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _save_json(path, data):
+    """Write application data in a stable, human-readable JSON format."""
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+
+
 def load_history():
-    if os.path.exists(HISTORY_PATH):
-        try:
-            with open(HISTORY_PATH) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    """Return recently typed text, newest first."""
+    return _load_json(HISTORY_PATH, [])
 
 def save_to_history(text):
+    """Add text to history while preserving uniqueness and the size limit."""
     history = load_history()
     # Remove duplicate if exists, then prepend
     history = [t for t in history if t != text]
     history.insert(0, text)
     history = history[:MAX_HISTORY]
-    with open(HISTORY_PATH, "w") as f:
-        json.dump(history, f, indent=2)
+    _save_json(HISTORY_PATH, history)
 
 # ── Presets ───────────────────────────────────────────────────────────────────
 def load_presets():
-    if os.path.exists(PRESETS_PATH):
-        try:
-            with open(PRESETS_PATH) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    """Return the map of saved preset names to typing configurations."""
+    return _load_json(PRESETS_PATH, {})
 
 def save_presets(presets):
-    with open(PRESETS_PATH, "w") as f:
-        json.dump(presets, f, indent=2)
+    """Persist the complete preset map."""
+    _save_json(PRESETS_PATH, presets)
 
 # ── App settings (persists slider values, UI state, flags) ───────────────────
 def _load_settings_raw():
-    if os.path.exists(SETTINGS_PATH):
-        try:
-            with open(SETTINGS_PATH) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return _load_json(SETTINGS_PATH, {})
 
 def _save_settings_raw(data):
     try:
-        with open(SETTINGS_PATH, "w") as f:
-            json.dump(data, f, indent=2)
+        _save_json(SETTINGS_PATH, data)
     except Exception:
         pass
 
 def save_settings():
+    """Persist control values and appearance settings without blocking exit."""
     try:
         data = _load_settings_raw()
         data['ui'] = get_current_config()
@@ -485,59 +503,157 @@ def save_settings():
         pass
 
 def load_settings():
+    """Restore saved controls, appearance, and macOS visibility behavior."""
     data = _load_settings_raw()
-    cfg  = data.get('ui')
-    if cfg:
+    ui_config = data.get('ui')
+    if ui_config:
         try:
-            apply_config(cfg)
+            apply_config(ui_config)
         except Exception:
             pass
-    cm = data.get('color_mode')
-    if cm:
+    color_mode = data.get('color_mode')
+    if color_mode:
         try:
-            mode_menu.set(cm)
-            ctk.set_appearance_mode(cm)
+            mode_menu.set(color_mode)
+            ctk.set_appearance_mode(color_mode)
         except Exception:
             pass
     # Always apply window mode (defaulting to both) — this also builds the menu bar
-    wm = data.get('window_mode', 'Dock + Menu Bar')
+    window_mode = data.get('window_mode', 'Dock + Menu Bar')
     try:
-        window_mode_menu.set(wm)
+        window_mode_menu.set(window_mode)
     except Exception:
         pass
-    apply_window_mode(
-        {"Dock + Menu Bar": "both", "Dock Only": "dock",
-         "Menu Bar Only": "menubar", "Neither": "neither"}.get(wm, "both"))
+    apply_window_mode(WINDOW_MODE_VALUES.get(window_mode, "both"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GUI
 # ══════════════════════════════════════════════════════════════════════════════
-TEAL       = ("#1ab8cc", "#2dd4e8")
-TEAL_HOVER = ("#139aac", "#1ab8cc")
-CARD_BG    = ("#f2f4f8", "#2b2b2b")
-CARD_BDR   = ("#d4d8e2", "#3a3a3a")
-SIDEBAR_BG = ("#dde3ed", "#1e1e1e")
-APP_BG     = ("#e8ecf2", "#242424")
-NAV_ACTIVE = ("#ccd8ec", "#363636")
-NAV_HOVER  = ("#d8e0ee", "#303030")
-MUTED      = ("#6688aa", "#888888")
-HDR_TEXT   = ("#0d1a30", "#e8e8e8")
-TEAL_RGB   = (45, 212, 232)
-MUTED_RGB  = (140, 180, 200)
-NAV_W      = 68
+class SmoothScrollableFrame(ctk.CTkScrollableFrame):
+    """CTk scroll frame with stable macOS trackpad boundaries."""
+
+    _EDGE_EPSILON = 1e-5
+    _EDGE_LOCK_SECONDS = 0.12
+    _MAX_SCROLL_STEPS = 4
+
+    def __init__(self, *args, **kwargs):
+        self._edge_lock_until = 0.0
+        self._edge_lock_position = None
+        super().__init__(*args, **kwargs)
+
+    def _event_is_inside(self, widget):
+        while widget is not None:
+            if widget == self._parent_canvas:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _event_targets_nested_scroll(self, widget):
+        """Keep a child editor's wheel events out of the page scroller."""
+        while widget is not None and widget != self._parent_canvas:
+            if getattr(widget, "_blocks_parent_scroll", False):
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _mouse_wheel_all(self, event):
+        if not self._event_is_inside(event.widget):
+            return None
+        if self._event_targets_nested_scroll(event.widget):
+            # Tk's Text class has already handled the wheel event before the
+            # global binding runs. Stop here so the page does not move too.
+            return "break"
+        if sys.platform != "darwin":
+            return super()._mouse_wheel_all(event)
+
+        canvas = self._parent_canvas
+        horizontal = self._shift_pressed
+        view = canvas.xview if horizontal else canvas.yview
+        move_to = canvas.xview_moveto if horizontal else canvas.yview_moveto
+        scroll_by = canvas.xview_scroll if horizontal else canvas.yview_scroll
+
+        try:
+            delta = int(event.delta)
+        except (TypeError, ValueError):
+            return "break"
+        if delta == 0:
+            return "break"
+
+        steps = max(-self._MAX_SCROLL_STEPS,
+                    min(self._MAX_SCROLL_STEPS, -delta))
+        now = time.monotonic()
+        if now < self._edge_lock_until and self._edge_lock_position is not None:
+            blocked_direction = -1 if self._edge_lock_position == 0.0 else 1
+            if (steps < 0) == (blocked_direction < 0):
+                move_to(self._edge_lock_position)
+                return "break"
+            self._edge_lock_position = None
+
+        first, last = view()
+        at_start = first <= self._EDGE_EPSILON
+        at_end = last >= 1.0 - self._EDGE_EPSILON
+
+        if (steps < 0 and at_start) or (steps > 0 and at_end):
+            edge = 0.0 if steps < 0 else 1.0
+            move_to(edge)
+            self._edge_lock_position = edge
+            self._edge_lock_until = now + self._EDGE_LOCK_SECONDS
+            return "break"
+
+        self._edge_lock_position = None
+        scroll_by(steps, "units")
+
+        # Snap fractional positions to a hard boundary. macOS momentum events
+        # can otherwise alternate around the last pixel and shake the content.
+        first, last = view()
+        if steps < 0 and first <= self._EDGE_EPSILON:
+            move_to(0.0)
+        elif steps > 0 and last >= 1.0 - self._EDGE_EPSILON:
+            move_to(1.0)
+        return "break"
+
+
+TEAL          = ("#2563eb", "#5aa2ff")
+TEAL_HOVER    = ("#1d4ed8", "#3f8eeb")
+CARD_BG       = ("#ffffff", "#292a2d")
+CARD_BDR      = ("#d5d7db", "#3c3e42")
+SIDEBAR_BG    = ("#f0f1f3", "#1a1b1d")
+APP_BG        = ("#f7f7f8", "#222326")
+INPUT_BG      = ("#f2f3f5", "#1e1f21")
+NAV_ACTIVE    = ("#e7eefc", "#30343a")
+NAV_HOVER     = ("#e9eaed", "#2b2c2f")
+MUTED         = ("#5f6368", "#a6a9ae")
+HDR_TEXT      = ("#202124", "#f2f3f5")
+PRIMARY_TEXT  = ("#ffffff", "#0b1629")
+SCROLL_THUMB  = ("#aeb2b8", "#565a60")
+DANGER        = ("#b63d48", "#f06a73")
+DANGER_HOVER  = ("#f5dadd", "#44252a")
+TEAL_RGB      = (90, 162, 255)
+MUTED_RGB     = (166, 169, 174)
+NAV_W         = 132
+FONT_FAMILY   = "SF Pro Text"
 
 app = ctk.CTk()
 app.title("Human Typer")
-app.geometry("700x700")
-app.resizable(False, False)
+app.geometry("820x760")
+app.minsize(720, 660)
+app.resizable(True, True)
 app.configure(fg_color=APP_BG)
+
+# Give macOS a full-resolution application icon instead of inheriting the
+# low-resolution Python launcher icon in the Dock and app switcher.
+_dock_icon = None
+if os.path.exists(LOGO_PATH):
+    _dock_icon = NSImage.alloc().initWithContentsOfFile_(LOGO_PATH)
+    if _dock_icon is not None:
+        NSApplication.sharedApplication().setApplicationIconImage_(_dock_icon)
 
 # ── Menu bar status item ──────────────────────────────────────────────────────
 _status_item = None
 
 _context_menu   = None  # right-click menu
 _pin_item       = None  # NSMenuItem for pin toggle
-_pinned         = [False]  # mutable so poller can update it
+_pinned = False
 
 class _MenuDelegate(NSObject):
     def handleClick_(self, sender):
@@ -546,13 +662,13 @@ class _MenuDelegate(NSObject):
         if event and event.type() == 3:
             _status_item.popUpStatusItemMenu_(_context_menu)
         else:
-            _ui_queue.put("show")
+            _ui_queue.put(UI_COMMAND_SHOW)
 
     def quitApp_(self, sender):
-        _ui_queue.put("quit")
+        _ui_queue.put(UI_COMMAND_QUIT)
 
     def togglePin_(self, sender):
-        _ui_queue.put("toggle_pin")
+        _ui_queue.put(UI_COMMAND_TOGGLE_PIN)
 
 _menu_delegate = _MenuDelegate.alloc().init()
 
@@ -594,7 +710,7 @@ def _build_menu_bar():
     btn.sendActionOn_(2 | 8)  # left + right mouse down
 
 def apply_window_mode(mode):
-    """mode: 'both' | 'dock' | 'menubar' | 'neither'"""
+    """Apply one of: ``both``, ``dock``, ``menubar``, or ``neither``."""
     ns_app = NSApplication.sharedApplication()
     global _status_item
     show_menubar = mode in ("both", "menubar")
@@ -620,13 +736,13 @@ def apply_window_mode(mode):
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyRegular)
 _build_menu_bar()
 
-_ico_home_active = ctk.CTkImage(make_grid_icon(22, TEAL_RGB),  size=(22, 22))
-_ico_home_idle   = ctk.CTkImage(make_grid_icon(22, MUTED_RGB), size=(22, 22))
-_ico_gear_active = ctk.CTkImage(make_gear_icon(22, TEAL_RGB),  size=(22, 22))
-_ico_gear_idle   = ctk.CTkImage(make_gear_icon(22, MUTED_RGB), size=(22, 22))
+_ico_home_active = ctk.CTkImage(make_grid_icon(20, TEAL_RGB),  size=(20, 20))
+_ico_home_idle   = ctk.CTkImage(make_grid_icon(20, MUTED_RGB), size=(20, 20))
+_ico_gear_active = ctk.CTkImage(make_gear_icon(20, TEAL_RGB),  size=(20, 20))
+_ico_gear_idle   = ctk.CTkImage(make_gear_icon(20, MUTED_RGB), size=(20, 20))
 
 if LOGO_PATH and os.path.exists(LOGO_PATH):
-    _logo_img = ctk.CTkImage(Image.open(LOGO_PATH).convert("RGBA"), size=(36, 36))
+    _logo_img = ctk.CTkImage(Image.open(LOGO_PATH).convert("RGBA"), size=(46, 46))
 else:
     _logo_img = None
 
@@ -639,26 +755,39 @@ right_area = ctk.CTkFrame(app, corner_radius=0, fg_color=APP_BG)
 right_area.pack(side="left", fill="both", expand=True)
 
 if _logo_img:
-    ctk.CTkLabel(sidebar, image=_logo_img, text="").pack(pady=(16, 6))
-ctk.CTkFrame(sidebar, height=1, fg_color=CARD_BDR).pack(fill="x", padx=10, pady=6)
+    ctk.CTkLabel(sidebar, image=_logo_img, text="").pack(pady=(18, 5))
+ctk.CTkLabel(sidebar, text="Human Typer", font=ctk.CTkFont(
+    family=FONT_FAMILY, size=13, weight="bold"), text_color=HDR_TEXT).pack(pady=(0, 14))
+ctk.CTkFrame(sidebar, height=1, fg_color=CARD_BDR).pack(fill="x", padx=14, pady=(0, 12))
 
-nav_home_btn = ctk.CTkButton(sidebar, image=_ico_home_active, text="", width=46, height=46,
-                               fg_color=NAV_ACTIVE, hover_color=NAV_HOVER, corner_radius=12)
-nav_home_btn.pack(pady=(4, 2))
+nav_home_btn = ctk.CTkButton(
+    sidebar, image=_ico_home_active, text="Type", compound="left", anchor="w",
+    width=104, height=42, font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+    fg_color=NAV_ACTIVE, hover_color=NAV_HOVER, text_color=HDR_TEXT, corner_radius=10)
+nav_home_btn.pack(fill="x", padx=12, pady=(0, 6))
 
-nav_gear_btn = ctk.CTkButton(sidebar, image=_ico_gear_idle, text="", width=46, height=46,
-                               fg_color="transparent", hover_color=NAV_HOVER, corner_radius=12)
-nav_gear_btn.pack(pady=2)
+nav_gear_btn = ctk.CTkButton(
+    sidebar, image=_ico_gear_idle, text="Settings", compound="left", anchor="w",
+    width=104, height=42, font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+    fg_color="transparent", hover_color=NAV_HOVER, text_color=MUTED, corner_radius=10)
+nav_gear_btn.pack(fill="x", padx=12, pady=0)
 
 # ── Page header ───────────────────────────────────────────────────────────────
-page_header = ctk.CTkFrame(right_area, height=56, corner_radius=0, fg_color="transparent")
+page_header = ctk.CTkFrame(right_area, height=76, corner_radius=0, fg_color="transparent")
 page_header.pack(fill="x")
 page_header.pack_propagate(False)
 
-page_title_lbl = ctk.CTkLabel(page_header, text="Human Typer",
-                                font=ctk.CTkFont(family="SF Pro Display", size=22, weight="bold"),
-                                text_color=HDR_TEXT)
-page_title_lbl.pack(side="left", padx=20)
+page_heading = ctk.CTkFrame(page_header, fg_color="transparent")
+page_heading.pack(side="left", padx=24, pady=(13, 10))
+page_title_lbl = ctk.CTkLabel(
+    page_heading, text="Type text",
+    font=ctk.CTkFont(family="SF Pro Display", size=23, weight="bold"),
+    text_color=HDR_TEXT, anchor="w")
+page_title_lbl.pack(anchor="w")
+page_subtitle_lbl = ctk.CTkLabel(
+    page_heading, text="Natural rhythm, precise control",
+    font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color=MUTED, anchor="w")
+page_subtitle_lbl.pack(anchor="w", pady=(1, 0))
 
 ctk.CTkFrame(right_area, height=1, fg_color=CARD_BDR).pack(fill="x")
 
@@ -669,33 +798,19 @@ page_container.grid_columnconfigure(0, weight=1)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def card(parent, **kw):
-    return ctk.CTkFrame(parent, corner_radius=12, fg_color=CARD_BG,
+    return ctk.CTkFrame(parent, corner_radius=14, fg_color=CARD_BG,
                          border_width=1, border_color=CARD_BDR, **kw)
 
 def section_lbl(parent, text):
-    ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=10, weight="bold"),
-                 text_color=MUTED).pack(anchor="w", padx=4, pady=(14, 4))
-
-def slider_row(parent, label, from_, to, steps, default, fmt=str, pady=(12, 12)):
-    f = ctk.CTkFrame(parent, fg_color="transparent")
-    f.pack(fill="x", padx=14, pady=pady)
-    top = ctk.CTkFrame(f, fg_color="transparent")
-    top.pack(fill="x")
-    ctk.CTkLabel(top, text=label, font=ctk.CTkFont(size=13), text_color=HDR_TEXT).pack(side="left")
-    val_lbl = ctk.CTkLabel(top, text=fmt(default),
-                            font=ctk.CTkFont(size=13, weight="bold"), text_color=TEAL)
-    val_lbl.pack(side="right")
-    sl = ctk.CTkSlider(f, from_=from_, to=to, number_of_steps=steps,
-                        progress_color=TEAL, button_color=TEAL, button_hover_color=TEAL_HOVER,
-                        command=lambda v, l=val_lbl, fn=fmt: l.configure(text=fn(v)))
-    sl.set(default)
-    sl.pack(fill="x", pady=(6, 0))
-    return sl
+    ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(
+        family=FONT_FAMILY, size=11, weight="bold"),
+        text_color=MUTED).pack(anchor="w", padx=4, pady=(20, 7))
 
 def opt_row(parent, label_text, pady=(10, 0)):
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(fill="x", padx=16, pady=pady)
-    ctk.CTkLabel(row, text=label_text, font=ctk.CTkFont(size=13), text_color=HDR_TEXT).pack(side="left")
+    ctk.CTkLabel(row, text=label_text, font=ctk.CTkFont(
+        family=FONT_FAMILY, size=13), text_color=HDR_TEXT).pack(side="left")
     var = ctk.IntVar()
     sw  = ctk.CTkSwitch(row, text="", variable=var, width=46,
                          progress_color=TEAL, button_color=("#f0f0f0", "#e0e0e0"))
@@ -710,14 +825,14 @@ main_wrap.grid(row=0, column=0, sticky="nsew")
 main_wrap.grid_rowconfigure(0, weight=1)
 main_wrap.grid_columnconfigure(0, weight=1)
 
-scroll = ctk.CTkScrollableFrame(main_wrap, fg_color="transparent",
-                                  corner_radius=0, scrollbar_button_color=CARD_BDR)
-scroll.grid(row=0, column=0, sticky="nsew", padx=16, pady=(10, 0))
+scroll = SmoothScrollableFrame(main_wrap, fg_color="transparent",
+                               corner_radius=0, scrollbar_button_color=SCROLL_THUMB)
+scroll.grid(row=0, column=0, sticky="nsew", padx=22, pady=(8, 0))
 
 # ── helper: small description text under a control ───────────────────────────
 def desc_lbl(parent, text):
-    ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=11),
-                 text_color=MUTED, anchor="w", wraplength=400,
+    ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+                 text_color=MUTED, anchor="w", wraplength=540,
                  justify="left").pack(anchor="w", padx=16, pady=(0, 8))
 
 def divider(parent):
@@ -727,10 +842,14 @@ def divider(parent):
 section_lbl(scroll, "TEXT TO TYPE")
 text_card = card(scroll)
 text_card.pack(fill="x", pady=(0, 2))
-text_box = ctk.CTkTextbox(text_card, height=148, corner_radius=10,
-                            fg_color="transparent", border_width=0,
-                            font=ctk.CTkFont(size=13), text_color=HDR_TEXT)
-text_box.pack(fill="x", padx=2, pady=2)
+text_box = ctk.CTkTextbox(
+    text_card, height=170, corner_radius=10, fg_color=INPUT_BG, border_width=0,
+    font=ctk.CTkFont(family=FONT_FAMILY, size=13), text_color=HDR_TEXT)
+text_box.pack(fill="x", padx=8, pady=8)
+# CTkScrollableFrame listens globally for wheel events. Mark both the wrapper
+# and native Text widget so its own scrolling never also moves the main page.
+text_box._blocks_parent_scroll = True
+text_box._textbox._blocks_parent_scroll = True
 
 def load_from_file():
     import tkinter.filedialog as fd
@@ -798,8 +917,9 @@ wpm_block.pack(side="left", padx=(0, 20))
 ctk.CTkLabel(wpm_block, text="Words Per Minute", font=ctk.CTkFont(size=11, weight="bold"),
              text_color=MUTED).pack(anchor="w")
 wpm_entry = ctk.CTkEntry(wpm_block, width=80, height=36,
-                          font=ctk.CTkFont(size=18, weight="bold"),
+                          font=ctk.CTkFont(family=FONT_FAMILY, size=18, weight="bold"),
                           justify="center", corner_radius=8,
+                          fg_color=INPUT_BG, border_width=1,
                           border_color=TEAL, text_color=HDR_TEXT)
 wpm_entry.insert(0, "40")
 wpm_entry.pack(pady=(4, 0))
@@ -840,7 +960,7 @@ cap_val_lbl.pack(side="right")
 cap_slider = ctk.CTkSlider(speed_card, from_=0, to=100, number_of_steps=100,
                             progress_color=TEAL, button_color=TEAL, button_hover_color=TEAL_HOVER,
                             command=lambda v: cap_val_lbl.configure(
-                                text="Off" if int(v) == 0 else f"~{max(1, round(int(v) / 2))}%"))
+                                text=format_cap_intensity(v)))
 cap_slider.set(0)
 cap_slider.pack(fill="x", padx=14, pady=(6, 0))
 desc_lbl(speed_card, "Occasionally types a letter in the wrong case then immediately self-corrects — like accidentally holding Shift a beat too long. 0 = off, 100 = ~50% of letters affected.")
@@ -1035,34 +1155,49 @@ bg_sw.configure(command=on_bg_toggle)
 # ── Status bar + progress + buttons ──────────────────────────────────────────
 ctk.CTkFrame(main_wrap, height=1, fg_color=CARD_BDR).grid(row=1, column=0, sticky="ew")
 
-status_bar = ctk.CTkFrame(main_wrap, height=44, corner_radius=0, fg_color="transparent")
+status_bar = ctk.CTkFrame(main_wrap, height=42, corner_radius=0, fg_color=SIDEBAR_BG)
 status_bar.grid(row=2, column=0, sticky="ew")
 status_bar.grid_propagate(False)
 
 status_left = ctk.CTkFrame(status_bar, fg_color="transparent")
-status_left.pack(side="left", fill="y", padx=(16, 0))
+status_left.pack(side="left", fill="y", padx=(22, 0))
 ctk.CTkLabel(status_left, text="●", font=ctk.CTkFont(size=10), text_color=TEAL).pack(side="left", padx=(0, 4))
-status_lbl = ctk.CTkLabel(status_left, text="Ready", font=ctk.CTkFont(size=12), text_color=MUTED)
+status_lbl = ctk.CTkLabel(status_left, text="Ready", font=ctk.CTkFont(
+    family=FONT_FAMILY, size=12), text_color=MUTED)
 status_lbl.pack(side="left")
 
 progress_bar = ctk.CTkProgressBar(status_bar, height=6, corner_radius=3,
                                     progress_color=TEAL, fg_color=CARD_BDR)
 progress_bar.set(0)
-progress_bar.pack(side="right", fill="x", expand=True, padx=16, pady=18)
+progress_bar.pack(side="right", fill="x", expand=True, padx=22, pady=18)
 
 def set_status(msg):
-    app.after(0, lambda: status_lbl.configure(text=msg))
+    _ui_queue.put((UI_COMMAND_STATUS, msg))
 
 def set_progress(val):
-    app.after(0, lambda: progress_bar.set(val))
+    _ui_queue.put((UI_COMMAND_PROGRESS, val))
 
-btn_frame = ctk.CTkFrame(main_wrap, fg_color="transparent")
-btn_frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 14))
+btn_frame = ctk.CTkFrame(main_wrap, fg_color=SIDEBAR_BG, corner_radius=0)
+btn_frame.grid(row=3, column=0, sticky="ew", padx=0, pady=0)
+
+def _run_typing(args):
+    try:
+        type_text(*args)
+    except Exception as exc:
+        set_status(f"Typing error: {exc}")
 
 def start_typing():
-    global stop_flag
+    """Validate the current controls and start one typing worker."""
+    global stop_flag, typing_thread
+    if typing_thread is not None and typing_thread.is_alive():
+        set_status("Already typing.")
+        return
+    if not AXIsProcessTrustedWithOptions({'AXTrustedCheckOptionPrompt': False}):
+        set_status("Grant Accessibility access, then restart Human Typer.")
+        return
+
     stop_flag = False
-    text = text_box.get("1.0", "end").strip()
+    text = text_box.get("1.0", "end-1c")
     if not text:
         set_status("No text to type.")
         return
@@ -1071,9 +1206,13 @@ def start_typing():
     except Exception:
         set_status("Invalid WPM value.")
         return
+    if not math.isfinite(wpm) or wpm <= 0:
+        set_status("WPM must be greater than zero.")
+        return
+
     set_progress(0)
     save_to_history(text)
-    threading.Thread(target=type_text, daemon=True, args=(
+    typing_args = (
         text, wpm,
         typo_slider.get() / 100,
         bool(adjacent_var.get()),
@@ -1093,24 +1232,28 @@ def start_typing():
         int(loop_delay_slider.get()),
         set_status,
         set_progress,
-    )).start()
+    )
+    typing_thread = threading.Thread(
+        target=_run_typing, args=(typing_args,), daemon=True)
+    typing_thread.start()
 
 def stop_typing():
+    """Request a cooperative stop and release a paused chunk worker."""
     global stop_flag
     stop_flag = True
     chunk_resume_event.set()  # unblock any waiting chunk
 
-ctk.CTkButton(btn_frame, text="Start Typing", height=42,
-               font=ctk.CTkFont(size=14, weight="bold"),
-               fg_color=TEAL, hover_color=TEAL_HOVER, text_color="#0b1426",
+ctk.CTkButton(btn_frame, text="Start typing", height=44,
+               font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
+               fg_color=TEAL, hover_color=TEAL_HOVER, text_color=PRIMARY_TEXT,
                corner_radius=10, command=start_typing
-               ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+               ).pack(side="left", fill="x", expand=True, padx=(22, 8), pady=(4, 16))
 
-ctk.CTkButton(btn_frame, text="Stop", height=42, width=90,
-               font=ctk.CTkFont(size=14, weight="bold"),
-               fg_color=("#e05050", "#c03030"), hover_color=("#b83030", "#902020"),
-               corner_radius=10, command=stop_typing
-               ).pack(side="right")
+ctk.CTkButton(btn_frame, text="Stop", height=44, width=96,
+               font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
+               fg_color="transparent", hover_color=DANGER_HOVER, text_color=DANGER,
+               border_width=1, border_color=DANGER, corner_radius=10, command=stop_typing
+               ).pack(side="right", padx=(0, 22), pady=(4, 16))
 
 # ═══════════════════════════════════════════
 # SETTINGS PAGE
@@ -1118,18 +1261,23 @@ ctk.CTkButton(btn_frame, text="Stop", height=42, width=90,
 settings_wrap = ctk.CTkFrame(page_container, fg_color="transparent", corner_radius=0)
 settings_wrap.grid(row=0, column=0, sticky="nsew")
 
-settings_scroll = ctk.CTkScrollableFrame(settings_wrap, fg_color="transparent",
-                                           corner_radius=0, scrollbar_button_color=CARD_BDR)
-settings_scroll.pack(fill="both", expand=True, padx=16, pady=(10, 10))
+settings_scroll = SmoothScrollableFrame(settings_wrap, fg_color="transparent",
+                                        corner_radius=0, scrollbar_button_color=SCROLL_THUMB)
+settings_scroll.pack(fill="both", expand=True, padx=22, pady=(8, 16))
 
 # ── Appearance ────────────────────────────────────────────────────────────────
 section_lbl(settings_scroll, "APPEARANCE")
 app_card = card(settings_scroll)
 app_card.pack(fill="x", pady=(0, 4))
-ar = ctk.CTkFrame(app_card, fg_color="transparent")
-ar.pack(fill="x", padx=16, pady=14)
-ctk.CTkLabel(ar, text="Color Mode", font=ctk.CTkFont(size=13), text_color=HDR_TEXT).pack(side="left")
-mode_menu = ctk.CTkOptionMenu(ar, values=["Dark", "Light", "System"],
+appearance_row = ctk.CTkFrame(app_card, fg_color="transparent")
+appearance_row.pack(fill="x", padx=16, pady=14)
+ctk.CTkLabel(
+    appearance_row,
+    text="Color Mode",
+    font=ctk.CTkFont(size=13),
+    text_color=HDR_TEXT,
+).pack(side="left")
+mode_menu = ctk.CTkOptionMenu(appearance_row, values=["Dark", "Light", "System"],
                                fg_color=CARD_BG, button_color=TEAL, button_hover_color=TEAL_HOVER,
                                dropdown_fg_color=CARD_BG,
                                command=lambda v: ctk.set_appearance_mode(v), width=120)
@@ -1138,19 +1286,16 @@ mode_menu.pack(side="right")
 
 ctk.CTkFrame(app_card, height=1, fg_color=CARD_BDR).pack(fill="x", padx=10)
 
-wr = ctk.CTkFrame(app_card, fg_color="transparent")
-wr.pack(fill="x", padx=16, pady=14)
-ctk.CTkLabel(wr, text="Window Visibility", font=ctk.CTkFont(size=13),
+window_visibility_row = ctk.CTkFrame(app_card, fg_color="transparent")
+window_visibility_row.pack(fill="x", padx=16, pady=14)
+ctk.CTkLabel(window_visibility_row, text="Window Visibility", font=ctk.CTkFont(size=13),
              text_color=HDR_TEXT).pack(side="left")
 window_mode_menu = ctk.CTkOptionMenu(
-    wr,
+    window_visibility_row,
     values=["Dock + Menu Bar", "Dock Only", "Menu Bar Only", "Neither"],
     fg_color=CARD_BG, button_color=TEAL, button_hover_color=TEAL_HOVER,
     dropdown_fg_color=CARD_BG, width=150,
-    command=lambda v: apply_window_mode(
-        {"Dock + Menu Bar": "both", "Dock Only": "dock",
-         "Menu Bar Only": "menubar", "Neither": "neither"}[v]
-    )
+    command=lambda value: apply_window_mode(WINDOW_MODE_VALUES[value])
 )
 window_mode_menu.set("Dock + Menu Bar")
 window_mode_menu.pack(side="right")
@@ -1206,47 +1351,55 @@ def get_current_config():
         "loop_delay":       loop_delay_slider.get(),
     }
 
-def apply_config(cfg):
+def apply_config(config):
+    """Apply a persisted configuration to widgets and dependent UI states."""
+    cap_intensity = config.get("cap_intensity", 0)
+
     wpm_entry.delete(0, "end")
-    wpm_entry.insert(0, cfg.get("wpm", "40"))
-    typo_slider.set(cfg.get("typo", 0))
-    typo_val_lbl.configure(text=f"{int(cfg.get('typo', 0))}%")
-    adjacent_var.set(cfg.get("adjacent", 0))
-    cap_slider.set(cfg.get("cap_intensity", 0))
-    cap_val_lbl.configure(text="Off" if cfg.get("cap_intensity", 0) == 0 else f"~{max(1, round(int(cfg.get('cap_intensity', 0)) / 2))}%")
-    variance_slider.set(cfg.get("variance", 20))
-    fatigue_slider.set(cfg.get("fatigue", 0))
-    accel_var.set(cfg.get("acceleration", 0))
-    countdown_var.set(cfg.get("countdown", 5))
-    punct_var.set(cfg.get("punct", 0))
-    background_var.set(cfg.get("background", 0))
-    chunk_var.set(cfg.get("chunk", 0))
-    chunk_size_slider.set(cfg.get("chunk_size", 10))
-    breaks_var.set(cfg.get("breaks", 0))
-    breaks_slider.set(cfg.get("breaks_intensity", 20))
-    bi_val_lbl.configure(text=str(int(cfg.get("breaks_intensity", 20))))
-    loop_var.set(cfg.get("loop", 0))
-    loop_count_slider.set(cfg.get("loop_count", 2))
-    loop_delay_slider.set(cfg.get("loop_delay", 5))
-    on_breaks_toggle(); on_bg_toggle(); on_chunk_toggle(); on_loop_toggle()
+    wpm_entry.insert(0, config.get("wpm", "40"))
+    typo_slider.set(config.get("typo", 0))
+    typo_val_lbl.configure(text=f"{int(config.get('typo', 0))}%")
+    adjacent_var.set(config.get("adjacent", 0))
+    cap_slider.set(cap_intensity)
+    cap_val_lbl.configure(text=format_cap_intensity(cap_intensity))
+    variance_slider.set(config.get("variance", 20))
+    fatigue_slider.set(config.get("fatigue", 0))
+    accel_var.set(config.get("acceleration", 0))
+    countdown_var.set(config.get("countdown", 5))
+    punct_var.set(config.get("punct", 0))
+    background_var.set(config.get("background", 0))
+    chunk_var.set(config.get("chunk", 0))
+    chunk_size_slider.set(config.get("chunk_size", 10))
+    breaks_var.set(config.get("breaks", 0))
+    breaks_slider.set(config.get("breaks_intensity", 20))
+    bi_val_lbl.configure(text=str(int(config.get("breaks_intensity", 20))))
+    loop_var.set(config.get("loop", 0))
+    loop_count_slider.set(config.get("loop_count", 2))
+    loop_delay_slider.set(config.get("loop_delay", 5))
+    on_breaks_toggle()
+    on_bg_toggle()
+    on_chunk_toggle()
+    on_loop_toggle()
     update_counts()
 
 def refresh_preset_list():
-    for w in preset_list_frame.winfo_children():
-        w.destroy()
+    for widget in preset_list_frame.winfo_children():
+        widget.destroy()
     presets = load_presets()
     if not presets:
         ctk.CTkLabel(preset_list_frame, text="No saved presets yet.",
                      font=ctk.CTkFont(size=12), text_color=MUTED).pack(pady=8)
         return
-    for name, cfg in presets.items():
+    for name, config in presets.items():
         row = ctk.CTkFrame(preset_list_frame, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=3)
         ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=13),
                      text_color=HDR_TEXT).pack(side="left")
         ctk.CTkButton(row, text="Load", width=60, height=28, font=ctk.CTkFont(size=12),
                       fg_color=TEAL, hover_color=TEAL_HOVER, text_color="#0b1426",
-                      corner_radius=8, command=lambda c=cfg: apply_config(c)).pack(side="right", padx=(4, 0))
+                      corner_radius=8,
+                      command=lambda preset=config: apply_config(preset)).pack(
+                          side="right", padx=(4, 0))
         ctk.CTkButton(row, text="Delete", width=60, height=28, font=ctk.CTkFont(size=12),
                       fg_color=("#e05050", "#c03030"), hover_color=("#b83030", "#902020"),
                       corner_radius=8, command=lambda n=name: delete_preset(n)).pack(side="right", padx=(4, 0))
@@ -1288,8 +1441,8 @@ history_card = card(settings_scroll)
 history_card.pack(fill="x", pady=(0, 4))
 
 def refresh_history():
-    for w in history_list_frame.winfo_children():
-        w.destroy()
+    for widget in history_list_frame.winfo_children():
+        widget.destroy()
     history = load_history()
     if not history:
         ctk.CTkLabel(history_list_frame, text="No history yet.",
@@ -1317,52 +1470,24 @@ history_list_frame = ctk.CTkFrame(history_card, fg_color="transparent")
 history_list_frame.pack(fill="x", pady=(0, 8))
 refresh_history()
 
-# ── Claude Code integration ───────────────────────────────────────────────────
-section_lbl(settings_scroll, "CLAUDE CODE INTEGRATION")
-claude_card = card(settings_scroll)
-claude_card.pack(fill="x", pady=(0, 4))
-
-_ci_top = ctk.CTkFrame(claude_card, fg_color="transparent")
-_ci_top.pack(fill="x", padx=16, pady=(14, 4))
-ctk.CTkLabel(_ci_top, text="Local HTTP Server", font=ctk.CTkFont(size=13),
-             text_color=HDR_TEXT).pack(side="left")
-ctk.CTkLabel(_ci_top, text=f"port {HTTP_PORT}  ●  running",
-             font=ctk.CTkFont(size=12, weight="bold"), text_color=TEAL).pack(side="right")
-
-ctk.CTkLabel(claude_card,
-    text="Ask Claude Code to generate text and send it here. Two endpoints:",
-    font=ctk.CTkFont(size=11), text_color=MUTED, anchor="w"
-).pack(anchor="w", padx=16, pady=(0, 6))
-
-for label, cmd in (
-    ("Fill box only",        f'curl -X POST http://localhost:{HTTP_PORT}/type -d "your text"'),
-    ("Fill + start typing",  f'curl -X POST http://localhost:{HTTP_PORT}/type-and-start -d "your text"'),
-):
-    _row = ctk.CTkFrame(claude_card, fg_color=APP_BG, corner_radius=8)
-    _row.pack(fill="x", padx=16, pady=(0, 6))
-    ctk.CTkLabel(_row, text=label, font=ctk.CTkFont(size=10, weight="bold"),
-                 text_color=MUTED).pack(anchor="w", padx=10, pady=(6, 0))
-    ctk.CTkLabel(_row, text=cmd, font=ctk.CTkFont(family="Courier", size=11),
-                 text_color=HDR_TEXT, anchor="w", wraplength=480, justify="left"
-                 ).pack(anchor="w", padx=10, pady=(2, 6))
-
-ctk.CTkLabel(claude_card,
-    text='  Tip: tell Claude "send to Human Typer" and it will run the curl command for you.',
-    font=ctk.CTkFont(size=11), text_color=TEAL, anchor="w", wraplength=480, justify="left"
-).pack(anchor="w", padx=16, pady=(0, 12))
-
 # ── Page switching ────────────────────────────────────────────────────────────
 def show_page(name):
     if name == "main":
         main_wrap.tkraise()
-        page_title_lbl.configure(text="Human Typer")
-        nav_home_btn.configure(image=_ico_home_active, fg_color=NAV_ACTIVE)
-        nav_gear_btn.configure(image=_ico_gear_idle,   fg_color="transparent")
+        page_title_lbl.configure(text="Type text")
+        page_subtitle_lbl.configure(text="Natural rhythm, precise control")
+        nav_home_btn.configure(image=_ico_home_active, fg_color=NAV_ACTIVE,
+                               text_color=HDR_TEXT)
+        nav_gear_btn.configure(image=_ico_gear_idle, fg_color="transparent",
+                               text_color=MUTED)
     else:
         settings_wrap.tkraise()
         page_title_lbl.configure(text="Settings")
-        nav_home_btn.configure(image=_ico_home_idle,   fg_color="transparent")
-        nav_gear_btn.configure(image=_ico_gear_active, fg_color=NAV_ACTIVE)
+        page_subtitle_lbl.configure(text="Appearance, shortcuts, and saved presets")
+        nav_home_btn.configure(image=_ico_home_idle, fg_color="transparent",
+                               text_color=MUTED)
+        nav_gear_btn.configure(image=_ico_gear_active, fg_color=NAV_ACTIVE,
+                               text_color=HDR_TEXT)
         refresh_preset_list()
         refresh_history()
 
@@ -1384,12 +1509,11 @@ def _ctrl_opt():
     return bool(_pressed & _CTRL) and bool(_pressed & _ALT)
 
 def on_key_press(key):
-    global chunk_waiting
     _pressed.add(key)
 
     if _ctrl_opt():
         if key == _H_KEY:
-            app.after(0, start_typing)
+            _ui_queue.put(UI_COMMAND_START)
         elif key == _S_KEY:
             stop_typing()
         elif key == pynput_keyboard.Key.space:
@@ -1407,13 +1531,14 @@ def _start_hotkey_listener():
             AXIsProcessTrustedWithOptions({'AXTrustedCheckOptionPrompt': True})
             settings['accessibility_prompted'] = True
             _save_settings_raw(settings)
-        return  # listener won't work until app is restarted after granting access
+        set_status("Grant Accessibility access, then restart Human Typer.")
+        return
     try:
         listener = pynput_keyboard.Listener(
             on_press=on_key_press, on_release=on_key_release, daemon=True)
         listener.start()
-    except Exception:
-        pass
+    except Exception as exc:
+        set_status(f"Global hotkeys unavailable: {exc}")
 
 # Slight delay so window is visible before any permission dialog appears
 app.after(500, _start_hotkey_listener)
@@ -1431,28 +1556,39 @@ def _on_close():
     app.withdraw()
 
 def _poll_ui_queue():
+    global _pinned
+
     try:
         while True:
-            cmd = _ui_queue.get_nowait()
-            if cmd == "show":
+            command = _ui_queue.get_nowait()
+            if isinstance(command, tuple) and command[0] == UI_COMMAND_STATUS:
+                status_lbl.configure(text=command[1])
+            elif isinstance(command, tuple) and command[0] == UI_COMMAND_PROGRESS:
+                progress_bar.set(command[1])
+            elif command == UI_COMMAND_START:
+                start_typing()
+            elif command == UI_COMMAND_SHOW:
                 _show_window()
-            elif cmd == "quit":
-                _pinned[0] = False
+            elif command == UI_COMMAND_QUIT:
+                _pinned = False
                 save_settings()
                 app.destroy()
                 os._exit(0)
-            elif cmd == "toggle_pin":
-                _pinned[0] = not _pinned[0]
+            elif command == UI_COMMAND_TOGGLE_PIN:
+                _pinned = not _pinned
                 if _pin_item:
-                    _pin_item.setState_(1 if _pinned[0] else 0)
-    except _queue_mod.Empty:
+                    _pin_item.setState_(1 if _pinned else 0)
+    except queue.Empty:
         pass
     app.after(100, _poll_ui_queue)
 
 app.protocol("WM_DELETE_WINDOW", _on_close)
 
 # Dock icon clicked while window is hidden → show it
-app.createcommand('::tk::mac::ReopenApplication', lambda: _ui_queue.put("show"))
+app.createcommand(
+    "::tk::mac::ReopenApplication",
+    lambda: _ui_queue.put(UI_COMMAND_SHOW),
+)
 
 show_page("main")
 app.after(150, load_settings)

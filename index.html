@@ -242,19 +242,6 @@
     .kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 11px; font-family: "SF Mono", monospace; font-size: 11px; color: var(--teal); font-weight: 700; white-space: nowrap; }
     .hk-desc { font-size: 13px; color: var(--muted); }
 
-    /* ── CLAUDE ───────────────────────────────────────────────── */
-    .claude-inner {
-      background: #0e1f22; border: 1px solid rgba(45,212,232,.15);
-      border-radius: 20px; padding: 56px;
-      display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center;
-    }
-    @media (max-width: 760px) { .claude-inner { grid-template-columns: 1fr; padding: 32px 24px; gap: 32px; } }
-    .claude-inner h2 { font-size: clamp(24px, 3.5vw, 38px); font-weight: 800; letter-spacing: -1.5px; margin-bottom: 14px; line-height: 1.1; }
-    .claude-inner h2 span { color: var(--teal); }
-    .claude-inner p { font-size: 15px; color: var(--muted); margin-bottom: 28px; line-height: 1.75; }
-    .code-stack { display: flex; flex-direction: column; gap: 16px; }
-    .code-label { font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
-
     /* ── CTA ──────────────────────────────────────────────────── */
     .cta { text-align: center; padding: 100px 24px; border-top: 1px solid var(--border); position: relative; z-index: 1; }
     .cta h2 { font-size: clamp(32px, 5.5vw, 64px); font-weight: 800; letter-spacing: -2.5px; line-height: 1.0; margin-bottom: 16px; }
@@ -281,20 +268,19 @@
 <!-- NAV -->
 <nav>
   <a class="nav-brand" href="#">
-    <img src="human_typer_icon.png" alt="" />
+    <img src="human_typer_icon_hd.png" alt="" />
     Human Typer
   </a>
   <div class="nav-right">
     <a href="#features">Features</a>
     <a href="#install">Install</a>
-    <a href="#claude">Claude</a>
     <a class="nav-dl" href="https://github.com/The-Bean-Beater/human-typer" target="_blank">Download ↓</a>
   </div>
 </nav>
 
 <!-- HERO -->
 <div class="hero">
-  <img class="hero-logo" src="human_typer_icon.png" alt="Human Typer" />
+  <img class="hero-logo" src="human_typer_icon_hd.png" alt="Human Typer" />
   <h1>Type Like a <span class="grad">Human.</span></h1>
   <p class="hero-sub">A macOS auto-typer that makes your text look naturally typed — real mistakes, hesitations, fatigue, and rhythm. Not a bot. A human.</p>
   <div class="hero-btns">
@@ -337,7 +323,6 @@
     <span class="marquee-item"><span class="dot"></span>Capitalization Errors</span>
     <span class="marquee-item"><span class="dot"></span>Loop & Repeat</span>
     <span class="marquee-item"><span class="dot"></span>Presets</span>
-    <span class="marquee-item"><span class="dot"></span>Claude Integration</span>
     <span class="marquee-item"><span class="dot"></span>Menu Bar Mode</span>
     <span class="marquee-item"><span class="dot"></span>Adjustable WPM</span>
     <span class="marquee-item"><span class="dot"></span>Realistic Typos</span>
@@ -349,7 +334,6 @@
     <span class="marquee-item"><span class="dot"></span>Capitalization Errors</span>
     <span class="marquee-item"><span class="dot"></span>Loop & Repeat</span>
     <span class="marquee-item"><span class="dot"></span>Presets</span>
-    <span class="marquee-item"><span class="dot"></span>Claude Integration</span>
     <span class="marquee-item"><span class="dot"></span>Menu Bar Mode</span>
   </div>
 </div>
@@ -500,36 +484,6 @@ cd human-typer</div>
   </div>
 </div>
 
-<!-- CLAUDE -->
-<div class="section-wrap" id="claude">
-  <div class="claude-inner reveal">
-    <div>
-      <div class="section-tag">AI Integration</div>
-      <h2>Claude writes it.<br/><span>You "typed" it.</span></h2>
-      <p>Ask Claude Code to generate anything, then fire one curl command to send it straight here. Human Typer fills the box and starts typing automatically — no copy-paste, no switching windows.</p>
-      <a class="btn-primary" href="https://github.com/The-Bean-Beater/human-typer" target="_blank">Get Started</a>
-    </div>
-    <div class="code-stack">
-      <div>
-        <div class="code-label">Fill the text box</div>
-        <div class="code-wrap">
-          <div class="code-block" id="cb4">curl -X POST http://localhost:7799/type \
-  -d "your text here"</div>
-          <button class="copy-btn" onclick="cp('cb4',this)">Copy</button>
-        </div>
-      </div>
-      <div>
-        <div class="code-label">Fill + start typing immediately</div>
-        <div class="code-wrap">
-          <div class="code-block" id="cb5">curl -X POST http://localhost:7799/type-and-start \
-  -d "your text here"</div>
-          <button class="copy-btn" onclick="cp('cb5',this)">Copy</button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
 <!-- CTA -->
 <div class="cta reveal">
   <h2>Stop typing like a <span class="grad">robot.</span></h2>
@@ -544,7 +498,7 @@ cd human-typer</div>
 <!-- FOOTER -->
 <footer>
   <a class="footer-brand" href="#">
-    <img src="human_typer_icon.png" alt="" />
+    <img src="human_typer_icon_hd.png" alt="" />
     Human Typer
   </a>
   <div class="footer-r">

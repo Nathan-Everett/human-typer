@@ -1,4 +1,3 @@
-pyautogui
 customtkinter
 Pillow
 pynput
